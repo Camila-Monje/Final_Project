@@ -1,0 +1,276 @@
+// TIVA
+
+#include "msp.h"
+#include <stdint.h>
+#include <stdio.h>
+#include "..\\inc\\Clock.h"
+#include "..\\inc\\LaunchPad.h"
+#include "..\\inc\\Motor.h"
+#include "..\\inc\\Reflectance.h"
+#include "..\\inc\\UART0.h"
+#include "..\\inc\\Bump.h"
+
+// === Definición de estados ===
+typedef enum {
+    STATE_IDLE,
+    STATE_START,
+    STATE_LINE_FOLLOW,
+    STATE_DETECT_END,
+    STATE_REPOSITION,
+    STATE_SEND_RESULT_STOP,
+    STATE_RETURN_FROM_IRRIGATION,
+    STATE_IRRIGATION,
+    STATE_SEND_RESULT_IRRIG,
+    STATE_FAST
+} RobotState;
+
+volatile RobotState currentState = STATE_IDLE;
+
+// === Variables globales ===
+volatile uint32_t Time = 0;
+volatile uint8_t Data = 0;
+volatile int32_t Position = 0;
+    int baseSpeed = 2500;
+    int baseSpeed2 = 3000;
+
+// === UART Interrupt Handler ===
+void EUSCIA0_IRQHandler(void) {
+    char c = UART0_InChar();
+    if (c == '2') {
+        currentState = STATE_START;
+        printf("[UART] Comando recibido: 2\n\r");
+    } else if (c == '3') {
+        currentState = STATE_IRRIGATION;
+        printf("[UART] Comando recibido: 3\n\r");
+    } else if(c =='4'){
+        currentState = STATE_FAST;
+        printf("[UART] Comando recibido: 3\n\r");
+    }
+    else{
+        printf("[UART] Otro carácter: %c\n\r", c);
+    }
+}
+
+// === SysTick cada 1 ms ===
+void SysTick_Handler(void) {
+    Time++;
+    if (Time % 10 == 1) Reflectance_Start();
+    if (Time % 10 == 2) {
+        Data = Reflectance_End();
+        Position = Reflectance_Position(Data);
+    }
+}
+
+uint8_t get_reflectance(void) {
+    Reflectance_Start();
+    Clock_Delay1ms(1);
+    return Reflectance_End();  // Devuelve los 8 bits directamente
+}
+
+
+// === Reposicionamiento luego del seguimiento de línea ===
+void reset_motor(void) {
+    int aux = 0;
+    printf("[INFO] Reposicionando...\n\r");
+    Motor_Backward(1000, baseSpeed2);
+    Clock_Delay1ms(800);
+    Motor_Forward(baseSpeed2, 1000);
+    Clock_Delay1ms(1300);
+
+    uint8_t reflectance;
+        while (1) {
+        Reflectance_Start();
+        Clock_Delay1ms(1);
+        reflectance = Reflectance_End();
+
+        if (reflectance != 0xFF) {
+            Motor_Backward(baseSpeed, baseSpeed);
+            Clock_Delay1ms(10);
+
+        }else {
+        Motor_Stop();
+        aux++;
+        if (aux==100){
+            break;
+            }
+        }
+    }
+
+    Motor_Stop();
+}
+
+
+// === Reposicionamiento luego de irrigación ===
+void reset_motor_irrig(void) {
+    int aux = 0;
+    printf("[INFO] Retornando desde riego...\n\r");
+    Motor_Backward(1000, baseSpeed2);
+    Clock_Delay1ms(350);
+    Motor_Stop();
+    Clock_Delay1ms(500);
+
+    printf("[INFO] Iniciando búsqueda de línea de inicio...\n\r");
+
+    uint8_t reflectance;
+    while (1) {
+        Reflectance_Start();
+        Clock_Delay1ms(1);
+        reflectance = Reflectance_End();
+
+        if (reflectance != 0xFF) {
+            Motor_Backward(2000, 2000);
+            Clock_Delay1ms(10);
+
+        }else {
+        Motor_Stop();
+        aux++;
+        if (aux==100){
+            break;
+            }
+        }
+    }
+Motor_Stop();   
+}
+
+// === Movimiento de irrigación ===
+void irrigate_motor(void) {
+    printf("[INFO] Activando irrigación...\n\r");
+    Motor_Forward(baseSpeed, baseSpeed);
+    Clock_Delay1ms(1500);
+    Motor_Forward(1000, baseSpeed2);
+    Clock_Delay1ms(1000);
+    Motor_Stop();
+    Clock_Delay1ms(5000);
+}
+
+// === Control proporcional del seguidor de línea ===
+void line_follow_control(int baseSpeed, int Kp, int32_t Position) {
+    int correction = Kp * Position;
+    int leftSpeed = baseSpeed + correction;
+    int rightSpeed = baseSpeed - correction;
+
+    if (leftSpeed < 0) leftSpeed = 0;
+    if (rightSpeed < 0) rightSpeed = 0;
+    if (leftSpeed > 10000) leftSpeed = 10000;
+    if (rightSpeed > 10000) rightSpeed = 10000;
+
+    Motor_Forward(leftSpeed, rightSpeed);
+}
+
+// === Verifica si debe hacerse una pausa ===
+void pause_if_needed(uint32_t *count) {
+    (*count)++;
+    if (*count % 200000 == 0) {
+        Motor_Stop();
+        printf("[INFO] Pausa de 5 segundos...\n\r");
+        Clock_Delay1ms(5000);  // ← corregido a 5000 ms
+        }
+    }
+
+
+// === Función principal ===
+int main(void) {
+    int count = 0;
+    Clock_Init48MHz();
+    LaunchPad_Init();
+    Motor_Init();
+    Reflectance_Init();
+    Bump_Init();
+    UART0_Initprintf();
+    SysTick_Init(48000, 3);
+    EnableInterrupts();
+    EUSCI_A0->IE |= EUSCI_A_IE_RXIE;
+    NVIC_EnableIRQ(EUSCIA0_IRQn);
+
+    int printCounter = 0;
+    int count2 = 0;
+    int Kp = 6;
+ 
+
+    while (1) {
+        switch (currentState) {
+            case STATE_IDLE:
+                Motor_Stop();
+                LaunchPad_Output(RED);
+                break;
+
+            case STATE_START:
+                LaunchPad_Output(GREEN);
+                currentState = STATE_LINE_FOLLOW;
+                break;
+
+            case STATE_LINE_FOLLOW:
+                if (Bump_Read()) {
+                    Motor_Stop();
+                    currentState = STATE_DETECT_END;
+                } else {
+                    line_follow_control(baseSpeed, Kp, Position);
+                    count2;
+                    printCounter++;
+                    if (printCounter >= 50) {
+                        int32_t tenths = Position % 10;
+                        if (tenths < 0) tenths = -tenths;
+                        int32_t ones = Position / 10;
+                        //printf("Line sensor = %d.%1d mm\n\r", ones, tenths);
+                        printCounter = 0;
+                    }            
+                    pause_if_needed(&count);               
+                }
+                
+                break;
+
+            case STATE_DETECT_END:
+                LaunchPad_Output(BLUE);
+                Clock_Delay1ms(1000);
+                currentState = STATE_REPOSITION;
+                break;
+
+            case STATE_REPOSITION:
+                reset_motor();
+                currentState = STATE_SEND_RESULT_STOP;
+                break;
+
+            case STATE_SEND_RESULT_STOP:
+                UART0_OutChar('F');
+                printf("[INFO] Tarea finalizada. Enviado 'F'.\n\r");
+                LaunchPad_Output(0);
+                currentState = STATE_IDLE;
+                break;
+
+            case STATE_IRRIGATION:
+                irrigate_motor();
+                currentState = STATE_SEND_RESULT_IRRIG;
+                break;
+
+            case STATE_SEND_RESULT_IRRIG:
+                reset_motor_irrig();
+                currentState = STATE_RETURN_FROM_IRRIGATION;
+                break;
+
+            case STATE_RETURN_FROM_IRRIGATION:
+                UART0_OutChar('F');
+                printf("[INFO] Riego completado. Enviado 'F'.\n\r");
+                currentState = STATE_IDLE;
+                break;
+            
+            case STATE_FAST:
+            if (Bump_Read()) {
+                    Motor_Stop();
+                    currentState = STATE_DETECT_END;
+                } else {
+                    line_follow_control(baseSpeed2, Kp, Position);
+
+                    printCounter++;
+                    if (printCounter >= 50) {
+                        int32_t tenths = Position % 10;
+                        if (tenths < 0) tenths = -tenths;
+                        int32_t ones = Position / 10;
+                        //printf("Line sensor = %d.%1d mm\n\r", ones, tenths);
+                        printCounter = 0;
+                    }
+                }
+                break;
+            
+        }
+    }
+}
