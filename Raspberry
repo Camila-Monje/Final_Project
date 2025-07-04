@@ -11,7 +11,6 @@ from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 
-# === CONFIGURACIÓN GLOBAL ===
 TOKEN = '8027987269:AAHEzrXOv-IAYxBQ-xUtNjgXw7ul3-SOtnU'
 CAPTURA_DIR = 'capturas_dead'
 SERIAL_PORT = '/dev/ttyACM0'
@@ -19,61 +18,71 @@ BAUD_RATE = 115200
 
 CLASSES = ['ripe', 'semi ripe', 'dead']
 WAIT_SECONDS = 5
-TIEMPO_RECORRIDO = 60
+TIEMPO_RECORRIDO = 40
 
-# === Inicialización UART ===
+# UART
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    print(f"[INFO] Conectado al puerto {SERIAL_PORT} a {BAUD_RATE} bps")
+    print(f"Conectado al puerto {SERIAL_PORT} a {BAUD_RATE} bps")
 except serial.SerialException as e:
-    print(f"[ERROR] No se pudo abrir el puerto: {e}")
+    print(f"No se pudo abrir el puerto: {e}")
     exit(1)
 
 bot = Bot(token=TOKEN)
 model = YOLO('/home/raspdcl/Proyecto Final/best.pt')
 
-# === Inicializa la cámara ===
-def inicializar_camara():
+def camera():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("No se pudo abrir la cámara")
         exit()
     return cap
 
-# === Realiza la detección con YOLO ===
-def procesar_deteccion(frame):
-    results = model.predict(source=frame, save=False, conf=0.3, verbose=False)
+def detection(frame):
+    results = model.track(source=frame, persist=True, conf=0.1, verbose=False)
     names = model.names
     boxes = results[0].boxes
     labels = boxes.cls.cpu().numpy().astype(int) if boxes is not None else []
     clases_detectadas = [names[c] for c in labels if names[c] in CLASSES]
     return results[0], Counter(clases_detectadas)
 
-def limpiar_directorio_dead():
+def clear_folder():
     for archivo in os.listdir(CAPTURA_DIR):
         ruta_archivo = os.path.join(CAPTURA_DIR, archivo)
         try:
             os.remove(ruta_archivo)
-            print(f"[INFO] Imagen eliminada: {ruta_archivo}")
+            print(f"Imagen eliminada: {ruta_archivo}")
         except Exception as e:
-            print(f"[ERROR] No se pudo eliminar {ruta_archivo}: {e}")
+            print(f"No se pudo eliminar {ruta_archivo}: {e}")
 
-# === Guarda imágenes de frutillas muertas ===
-def guardar_fotos_dead(frame, cantidad, contador_dead):
-    for i in range(cantidad):
-        nombre = f"dead_{contador_dead + i + 1}.jpg"
-        ruta = os.path.join(CAPTURA_DIR, nombre)
-        cv2.imwrite(ruta, frame)
-    return contador_dead + cantidad
+def save_photos_all_classes(frame, detecciones, contador_total):
+    frame_con_boxes = frame.copy()
+    colores = {
+        'ripe': (0, 255, 0),
+        'semi ripe': (0, 255, 255),
+        'dead': (0, 0, 255)
+    }
 
-# === Recorre y detecta durante el recorrido ===
+    for box, cls_id in zip(detecciones.boxes.xyxy, detecciones.boxes.cls):
+        clase = model.names[int(cls_id)]
+        if clase in CLASSES:
+            x1, y1, x2, y2 = map(int, box.tolist())
+            color = colores.get(clase, (255, 255, 255))
+            cv2.rectangle(frame_con_boxes, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame_con_boxes, clase, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    nombre = f"deteccion_{contador_total + 1}.jpg"
+    ruta = os.path.join(CAPTURA_DIR, nombre)
+    cv2.imwrite(ruta, frame_con_boxes)
+    print(f"Imagen guardada con bounding boxes: {ruta}")
+    return contador_total + 1
+
 def recorrer_y_dibujar(cap):
     counted = {cls: 0 for cls in CLASSES}
-    last_detection_time = {cls: 0 for cls in CLASSES}
-    last_dead_save_time = 0
-    dead_image_count = 0
+    last_save_time = 0
+    image_count = 0
 
-    # Limpia carpeta de capturas
     if os.path.exists(CAPTURA_DIR):
         for f in os.listdir(CAPTURA_DIR):
             os.remove(os.path.join(CAPTURA_DIR, f))
@@ -89,21 +98,17 @@ def recorrer_y_dibujar(cap):
             break
 
         current_time = time.time()
-        result, frame_counts = procesar_deteccion(frame)
+        result, frame_counts = detection(frame)
 
-        # === Guardar imágenes de "dead"
-        dead_count = frame_counts.get("dead", 0)
-        if dead_count > 0 and (current_time - last_dead_save_time) >= WAIT_SECONDS:
-            dead_image_count = guardar_fotos_dead(frame, dead_count, dead_image_count)
-            last_dead_save_time = current_time
+        if sum(frame_counts.values()) > 0 and (current_time - last_save_time) >= WAIT_SECONDS:
+            image_count = save_photos_all_classes(frame, result, image_count)
+            last_save_time = current_time
 
-        # === Conteo simple cada WAIT_SECONDS
-        for cls in CLASSES:
-            if frame_counts.get(cls, 0) > 0 and (current_time - last_detection_time[cls]) >= WAIT_SECONDS:
-                counted[cls] += 1
-                last_detection_time[cls] = current_time
+            # Conteo directo de todas las detecciones por clase
+            for cls in CLASSES:
+                counted[cls] += frame_counts.get(cls, 0)
 
-        # === Detección de círculo azul
+        # Detección de círculo azul
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         lower_blue = np.array([100, 150, 50])
         upper_blue = np.array([140, 255, 255])
@@ -119,68 +124,52 @@ def recorrer_y_dibujar(cap):
 
         if circles is not None:
             ser.write(b"4\n")
-            print("[INFO] Círculo azul detectado → enviado '4'")
+            print("Círculo azul detectado → enviado '4'")
             break
 
-    return counted, dead_image_count
+    return counted, image_count
 
-# === Envía los resultados por Telegram ===
-async def enviar_resultado_telegram(detection, cantidad_dead_imgs, update):
-    msg = "Detección final tras el recorrido:\n"
-    msg += "\n".join([f"🔹 {k}: {v}" for k, v in detection.items()])
+async def send_images_telegram(detection, cantidad_imgs, update):
+    msg = "✅ Detección final tras el recorrido:\n"
+    msg += "\n".join([f"- {k}: {v}" for k, v in detection.items()])
 
     try:
         await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
-        print(f"[ERROR] No se pudo enviar mensaje por Telegram: {e}")
+        print(f"No se pudo enviar mensaje por Telegram: {e}")
 
-    if cantidad_dead_imgs > 0:
-        for i in range(cantidad_dead_imgs):
-            ruta = os.path.join(CAPTURA_DIR, f"dead_{i + 1}.jpg")
+    if cantidad_imgs > 0:
+        for i in range(cantidad_imgs):
+            ruta = os.path.join(CAPTURA_DIR, f"deteccion_{i + 1}.jpg")
             if os.path.exists(ruta):
                 try:
                     with open(ruta, 'rb') as photo:
-                        await update.message.reply_photo(photo=photo, caption="Frutilla muerta detectada")
+                        await update.message.reply_photo(photo=photo, caption=f"Detección {i + 1}")
                 except Exception as e:
-                    print(f"[ERROR] No se pudo enviar la imagen {ruta}: {e}")
+                    print(f"No se pudo enviar la imagen {ruta}: {e}")
     
-    limpiar_directorio_dead()
+    clear_folder()
 
-# === Comandos de Telegram ===
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot conectado vía UART.")
-    print("[BOT] Comando /start recibido")
-
-async def mover_adelante(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ser.write(b"2\n")
     await update.message.reply_text("➡ Comenzando recorrido")
-    print("[BOT] Comando /empezar_recorrido enviado: 2")
+    print("Comando /empezar_recorrido enviado: 2")
 
-    cap = inicializar_camara()
-    print("[INFO] Esperando 8 segundos antes de iniciar detección...")
-    time.sleep(8)
-    conteo_final, cantidad_dead_imgs = recorrer_y_dibujar(cap)
+    cap = camera()
+    conteo_final, cantidad_imgs = recorrer_y_dibujar(cap)
     cap.release()
-    await enviar_resultado_telegram(conteo_final, cantidad_dead_imgs, update)
+    await send_images_telegram(conteo_final, cantidad_imgs, update)
 
-async def mover_atras(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def irrigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ser.write(b"3\n")
     await update.message.reply_text("⬅ Inicio de riego")
-    print("[BOT] Comando /riego enviado: 3")
+    print("Comando /riego enviado: 3")
 
-async def detener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ser.write(b"S\n")
-    await update.message.reply_text("Enviando comando: S")
-    print("[BOT] Comando /stop enviado: S")
-
-# === Main ===
 def main():
     request = HTTPXRequest(connect_timeout=10.0, read_timeout=20.0)
     app = ApplicationBuilder().token(TOKEN).request(request).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("empezar_recorrido", mover_adelante))
-    app.add_handler(CommandHandler("riego", mover_atras))
-    app.add_handler(CommandHandler("stop", detener))
+    app.add_handler(CommandHandler("empezar_recorrido", monitoring))
+    app.add_handler(CommandHandler("riego", irrigation))
     print("Bot escuchando comandos...")
     app.run_polling()
 
