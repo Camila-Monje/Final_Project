@@ -30,9 +30,20 @@ volatile RobotState currentState = STATE_IDLE;
 volatile uint32_t Time = 0;
 volatile uint8_t Data = 0;
 volatile int32_t Position = 0;
-    int baseSpeed = 2500;
-    int baseSpeed2 = 3000;
-
+    int baseSpeed = 2000;
+    int baseSpeed2 = 2200;
+    int baseSpeed3 = 1600;
+    int baseSpeed4 = 1200;
+ int32_t lastError = 0;
+int32_t integral1 = 0;
+int factor=1;
+int x=0;
+    int printCounter = 0;
+    int count2 = 0;
+int aux2 = 0;
+    int Kp = 5;
+    int Ki = 0.1;    // Integral
+    int Kd = 2;    // Derivativo
 // === UART Interrupt Handler ===
 void EUSCIA0_IRQHandler(void) {
     char c = UART0_InChar();
@@ -69,48 +80,33 @@ uint8_t get_reflectance(void) {
 
 
 // === Reposicionamiento luego del seguimiento de línea ===
+// === Reposicionamiento luego del seguimiento de línea ===
 void reset_motor(void) {
     int aux = 0;
     printf("[INFO] Reposicionando...\n\r");
-    Motor_Backward(1000, baseSpeed2);
-    Clock_Delay1ms(800);
-    Motor_Forward(baseSpeed2, 1000);
-    Clock_Delay1ms(1300);
 
-    uint8_t reflectance;
-        while (1) {
+    Motor_Backward(100, 2500);
+    Clock_Delay1ms(1500);
+
+    Motor_Forward(2400*factor, 2600*factor);
+    Clock_Delay1ms(800);
+
+    Motor_Forward(2800*factor, 500*factor);
+    Clock_Delay1ms(900);
+
+    // === PID activo por 5 segundos ===
+    uint32_t time_ms = 0;
+    while (time_ms < 500*factor) {
         Reflectance_Start();
         Clock_Delay1ms(1);
-        reflectance = Reflectance_End();
-
-        if (reflectance != 0xFF) {
-            Motor_Backward(baseSpeed, baseSpeed);
-            Clock_Delay1ms(10);
-
-        }else {
-        Motor_Stop();
-        aux++;
-        if (aux==100){
-            break;
-            }
-        }
+        uint8_t reflectance = Reflectance_End();
+        Position = Reflectance_Position(reflectance);  // Actualiza Position
+        line_follow_pid(baseSpeed3*factor, Kp, Ki, Kd, Position);    
+        Clock_Delay1ms(1);
+        time_ms++;
     }
 
-    Motor_Stop();
-}
-
-
-// === Reposicionamiento luego de irrigación ===
-void reset_motor_irrig(void) {
-    int aux = 0;
-    printf("[INFO] Retornando desde riego...\n\r");
-    Motor_Backward(1000, baseSpeed2);
-    Clock_Delay1ms(350);
-    Motor_Stop();
-    Clock_Delay1ms(500);
-
-    printf("[INFO] Iniciando búsqueda de línea de inicio...\n\r");
-
+    // === Segunda parte: retroceder hasta encontrar línea negra ===
     uint8_t reflectance;
     while (1) {
         Reflectance_Start();
@@ -118,7 +114,38 @@ void reset_motor_irrig(void) {
         reflectance = Reflectance_End();
 
         if (reflectance != 0xFF) {
-            Motor_Backward(2000, 2000);
+            Motor_Backward(2300*factor, 2300*factor);
+            Clock_Delay1ms(10);
+        } else {
+            Motor_Stop();
+            aux++;
+            if (aux == 100) {
+                break;
+            }
+        }
+    }
+
+    Motor_Stop();
+}
+
+// === Movimiento de irrigación ===
+void irrigate_motor(void) {
+    int aux = 0;
+    //printf("[INFO] Retornando desde riego...\n\r");
+
+    Motor_Backward(3000*factor, 3000*factor);
+    Clock_Delay1ms(1600);
+    Motor_Stop();
+    Clock_Delay1ms(8000);
+    //printf("[INFO] Iniciando búsqueda de línea de inicio...\n\r");
+        uint8_t reflectance;
+        while (1) {
+        Reflectance_Start();
+        Clock_Delay1ms(1);
+        reflectance = Reflectance_End();
+
+        if (reflectance != 0xFF) {
+            Motor_Forward(1800*factor, 1800*factor);
             Clock_Delay1ms(10);
 
         }else {
@@ -129,30 +156,27 @@ void reset_motor_irrig(void) {
             }
         }
     }
-Motor_Stop();   
-}
 
-// === Movimiento de irrigación ===
-void irrigate_motor(void) {
-    printf("[INFO] Activando irrigación...\n\r");
-    Motor_Forward(baseSpeed, baseSpeed);
-    Clock_Delay1ms(1500);
-    Motor_Forward(1000, baseSpeed2);
-    Clock_Delay1ms(1000);
     Motor_Stop();
-    Clock_Delay1ms(5000);
 }
 
 // === Control proporcional del seguidor de línea ===
-void line_follow_control(int baseSpeed, int Kp, int32_t Position) {
-    int correction = Kp * Position;
-    int leftSpeed = baseSpeed + correction;
-    int rightSpeed = baseSpeed - correction;
+void line_follow_pid(int baseSpeed, int Kp, int Ki, int Kd, int32_t Position) {
+    int32_t error = Position;                  // Error actual (desviación de la línea)
+    integral1 += error;                         // Acumulado del error
+    int32_t derivative = error - lastError;    // Cambio en el error
+    lastError = error;                         // Actualizar error anterior
 
+    int32_t correction = Kp * error + Ki * integral1 + Kd * derivative;
+    printf("Corr: %ld\n\r", (int32_t)correction);
+    int32_t leftSpeed = baseSpeed + correction;
+    int32_t rightSpeed = baseSpeed - correction;
+
+    // Saturación de velocidad
     if (leftSpeed < 0) leftSpeed = 0;
     if (rightSpeed < 0) rightSpeed = 0;
-    if (leftSpeed > 10000) leftSpeed = 10000;
-    if (rightSpeed > 10000) rightSpeed = 10000;
+    if (leftSpeed > 4000) leftSpeed = 4000;
+    if (rightSpeed > 4000) rightSpeed = 4000;
 
     Motor_Forward(leftSpeed, rightSpeed);
 }
@@ -181,10 +205,6 @@ int main(void) {
     EnableInterrupts();
     EUSCI_A0->IE |= EUSCI_A_IE_RXIE;
     NVIC_EnableIRQ(EUSCIA0_IRQn);
-
-    int printCounter = 0;
-    int count2 = 0;
-    int Kp = 6;
  
 
     while (1) {
@@ -204,7 +224,7 @@ int main(void) {
                     Motor_Stop();
                     currentState = STATE_DETECT_END;
                 } else {
-                    line_follow_control(baseSpeed, Kp, Position);
+                    line_follow_pid(baseSpeed3, Kp, Ki, Kd, Position);
                     count2;
                     printCounter++;
                     if (printCounter >= 50) {
@@ -243,7 +263,7 @@ int main(void) {
                 break;
 
             case STATE_SEND_RESULT_IRRIG:
-                reset_motor_irrig();
+                //reset_motor_irrig();
                 currentState = STATE_RETURN_FROM_IRRIGATION;
                 break;
 
@@ -254,21 +274,27 @@ int main(void) {
                 break;
             
             case STATE_FAST:
-            if (Bump_Read()) {
-                    Motor_Stop();
-                    currentState = STATE_DETECT_END;
-                } else {
-                    line_follow_control(baseSpeed2, Kp, Position);
+                uint8_t reflectance;
+                while (1) {
+                    Reflectance_Start();
+                    Clock_Delay1ms(1);
+                    reflectance = Reflectance_End();
 
-                    printCounter++;
-                    if (printCounter >= 50) {
-                        int32_t tenths = Position % 10;
-                        if (tenths < 0) tenths = -tenths;
-                        int32_t ones = Position / 10;
-                        //printf("Line sensor = %d.%1d mm\n\r", ones, tenths);
-                        printCounter = 0;
+                    if (reflectance != 0xFF) {
+                        //Position = Reflectance_Position(reflectance);  // <-- actualiza Position
+                        line_follow_pid(baseSpeed2, Kp, Ki, Kd, Position);
+                        aux2 = 0;  // Reset si se vuelve a ver la línea
+                    } else {
+                        Motor_Stop();
+                        aux2++;
+                        if (aux2 == 100) {
+                            break;
+                        }
                     }
                 }
+                //Motor_Stop();
+                currentState = STATE_DETECT_END;
+                break;
                 break;
             
         }
